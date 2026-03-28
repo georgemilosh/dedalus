@@ -966,9 +966,58 @@ def flux_jacobian_loss(net, Q_batch,
     return total / n
 
 
+def precompute_cgl_growth_rates(Q_batch, k=1.0,
+                                gamma_par=3.0, gamma_perp=2.0,
+                                B_floor=1e-3, temperature=5.0):
+    r"""Precompute CGL soft-max growth rates for a batch of states.
+
+    This extracts the CGL-side computation from :func:`growth_rate_loss`
+    so it can be done once for a fixed pool of collocation states rather
+    than repeated every mini-batch.
+
+    Parameters
+    ----------
+    Q_batch : Tensor, shape ``(n, 7)``
+        Conserved-variable collocation states.
+    k : float
+        Wavenumber.
+    gamma_par, gamma_perp : float
+        CGL exponents.
+    B_floor : float
+        Magnetic-field floor.
+    temperature : float
+        Logsumexp sharpness.
+
+    Returns
+    -------
+    dict
+        ``{'cgl_growth_rates': Tensor}`` of shape ``(n,)``, ready to be
+        passed as extra keyword arguments to :func:`growth_rate_loss`.
+    """
+    n = Q_batch.shape[0]
+    targets = torch.empty(n, dtype=Q_batch.dtype, device=Q_batch.device)
+    eps = 1e-12
+
+    with torch.no_grad():
+        for i in range(n):
+            Q_i = Q_batch[i]
+            A_cgl = torch.autograd.functional.jacobian(
+                lambda q: flux_mhd_aniso(q, net=None, use_cgl=True,
+                                         gamma_par=gamma_par,
+                                         gamma_perp=gamma_perp,
+                                         B_floor=B_floor),
+                Q_i,
+            )
+            eig_cgl = torch.linalg.eigvals(A_cgl)
+            gamma_cgl = k * torch.sqrt(eig_cgl.imag ** 2 + eps)
+            targets[i] = torch.logsumexp(temperature * gamma_cgl, dim=0) / temperature
+
+    return {'cgl_growth_rates': targets}
+
+
 def growth_rate_loss(net, Q_batch, k=1.0,
                      gamma_par=3.0, gamma_perp=2.0, B_floor=1e-3,
-                     temperature=5.0):
+                     temperature=5.0, cgl_growth_rates=None):
     r"""Growth-rate matching loss via logsumexp soft-max (Method 3).
 
     Compares the soft-max of :math:`|Im}(\omega)|` between ML
@@ -989,9 +1038,14 @@ def growth_rate_loss(net, Q_batch, k=1.0,
     temperature : float
         Sharpness of the logsumexp soft-max.  Higher values approximate
         the hard max more closely.
+    cgl_growth_rates : Tensor or None
+        If provided (shape ``(n,)``), skip the CGL Jacobian /
+        eigendecomposition and use these precomputed soft-max growth
+        rates as targets.  Obtain via :func:`precompute_cgl_growth_rates`.
     """
     n = Q_batch.shape[0]
     total = torch.tensor(0.0, dtype=Q_batch.dtype, device=Q_batch.device)
+    eps = 1e-12
 
     for i in range(n):
         Q_i = Q_batch[i].detach().requires_grad_(True)
@@ -1003,27 +1057,26 @@ def growth_rate_loss(net, Q_batch, k=1.0,
                                      B_floor=B_floor),
             Q_i, create_graph=True,
         )
-        with torch.no_grad():
-            A_cgl = torch.autograd.functional.jacobian(
-                lambda q: flux_mhd_aniso(q, net=None, use_cgl=True,
-                                         gamma_par=gamma_par,
-                                         gamma_perp=gamma_perp,
-                                         B_floor=B_floor),
-                Q_i,
-            )
-
         eig_ml = torch.linalg.eigvals(A_ml)
-        eig_cgl = torch.linalg.eigvals(A_cgl)
-
-        # Smooth |Im(eig)| — use sqrt(x² + eps) for differentiability at 0
-        eps = 1e-12
         gamma_ml = k * torch.sqrt(eig_ml.imag ** 2 + eps)
-        gamma_cgl = k * torch.sqrt(eig_cgl.imag ** 2 + eps)
-
-        # Soft-max via logsumexp
         g_max_ml = torch.logsumexp(temperature * gamma_ml, dim=0) / temperature
-        g_max_cgl = (torch.logsumexp(temperature * gamma_cgl, dim=0)
-                     / temperature).detach()
+
+        if cgl_growth_rates is not None:
+            g_max_cgl = cgl_growth_rates[i].detach()
+        else:
+            with torch.no_grad():
+                A_cgl = torch.autograd.functional.jacobian(
+                    lambda q: flux_mhd_aniso(q, net=None, use_cgl=True,
+                                             gamma_par=gamma_par,
+                                             gamma_perp=gamma_perp,
+                                             B_floor=B_floor),
+                    Q_i,
+                )
+            eig_cgl = torch.linalg.eigvals(A_cgl)
+            gamma_cgl = k * torch.sqrt(eig_cgl.imag ** 2 + eps)
+            g_max_cgl = (torch.logsumexp(temperature * gamma_cgl, dim=0)
+                         / temperature).detach()
+
         total = total + (g_max_ml - g_max_cgl) ** 2
 
     return total / n
@@ -1264,12 +1317,12 @@ def prepare_ml_data(X, y, train_fraction=0.8, target_log_eps=1e-12,
 
 def _run_epoch(model, dataloader, optimizer, scheduler, loss_fn, device,
                train=False, rotate_batches=False,
-               physics_closure=None, lambda_phys=0.0):
+               physics_loss=None, lambda_phys=0.0):
     """Run a single training or evaluation epoch.
 
     Parameters
     ----------
-    physics_closure : callable or None
+    physics_loss : callable or None
         ``fn(model) -> scalar tensor`` that computes a physics-informed
         regularisation loss (e.g. tangent matching).  Called once per
         mini-batch during training and added with weight *lambda_phys*.
@@ -1285,36 +1338,66 @@ def _run_epoch(model, dataloader, optimizer, scheduler, loss_fn, device,
     # Determine model dtype so we can cast batches (guards against
     # torch.set_default_dtype(float64) producing double-precision DataLoaders
     # while model weights are float32).
+    # Get the model's dtype to ensure batches match (guards against
+    # torch.set_default_dtype(float64) producing double-precision DataLoaders
+    # while model weights are float32).
     model_dtype = next(model.parameters()).dtype
     total_data_loss = 0.0
     total_phys_loss = 0.0
+    
     if not train:
+        # Evaluation mode: no gradients, no updates
         with torch.no_grad():
             for xb, yb in dataloader:
+                # Cast batch to match model dtype and device
                 xb, yb = xb.to(device=device, dtype=model_dtype), yb.to(device=device, dtype=model_dtype)
+                # Forward pass
                 pred = model(xb)
+                # Accumulate MSE loss (weighted by batch size for averaging later)
                 total_data_loss += loss_fn(pred, yb).item() * len(xb)
     else:
+        # Training mode: compute gradients and update weights
         for xb, yb in dataloader:
+            # Cast batch to match model dtype and device
             xb, yb = xb.to(device=device, dtype=model_dtype), yb.to(device=device, dtype=model_dtype)
+            
+            # Apply on-the-fly rotation augmentation if enabled
             if rotate_batches:
                 xb = rotate_state_vectors_torch(xb)
+            
+            # Forward pass
             pred = model(xb)
+            # Compute data loss (MSE on normalized log-pressures)
             data_loss = loss_fn(pred, yb)
 
+            # Initialize combined loss with data loss
             combined = data_loss
-            if physics_closure is not None and lambda_phys > 0:
-                p_loss = physics_closure(model)
+            
+            # Add physics-informed regularisation if provided
+            if physics_loss is not None and lambda_phys > 0:
+                p_loss = physics_loss(model)
                 combined = data_loss + lambda_phys * p_loss
                 total_phys_loss += p_loss.item() * len(xb)
 
+            # Backpropagation and optimizer step
             optimizer.zero_grad()
             combined.backward()
+            # Gradient clipping to prevent explosion
+            # Prevents exploding gradients (especially in RNNs, stiff PDE surrogates, deep nets).
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # It looks at all parameter gradients in model.parameters().
+            # It computes one combined gradient norm (default is L2 norm).
+            # If that norm is greater than 1.0, it rescales all gradients by the same factor so the total norm becomes 1.0.
+            # If the norm is already <= 1.0, it leaves gradients unchanged.
             optimizer.step()
+            # Step learning-rate scheduler (e.g., OneCycleLR)
             if scheduler is not None:
                 scheduler.step()
+            
+            # Accumulate data loss (weighted by batch size for averaging later)
             total_data_loss += data_loss.item() * len(xb)
+    
+    # Return mean per-sample losses over the entire epoch
     n = len(dataloader.dataset)
     return total_data_loss / n, total_phys_loss / n
 
@@ -1328,7 +1411,7 @@ def train_surrogate(
     patience=50,
     base_lr=1e-3,
     weight_decay=1e-4,
-    use_rotation_augmentation=True,
+    use_rotation_augmentation=False,
     min_delta=1e-5,
     print_every=10,
     norm_data=None,
@@ -1339,6 +1422,9 @@ def train_surrogate(
     n_colloc=16,
     colloc_rho_range=(0.5, 2.0),
     colloc_Bmag_range=(0.5, 2.0),
+    # ── Precomputed collocation pool ──
+    colloc_pool_size=0,
+    colloc_precompute_fn=None,
 ):
     """Train an MLP surrogate with AdamW + OneCycleLR + early stopping.
 
@@ -1367,6 +1453,17 @@ def train_surrogate(
         physics loss.
     colloc_rho_range, colloc_Bmag_range : tuple[float, float]
         Sampling ranges for collocation states.
+    colloc_pool_size : int
+        When > 0, pre-sample this many collocation states **once** before
+        training and (if *colloc_precompute_fn* is given) precompute their
+        CGL targets.  Each mini-batch then draws *n_colloc* states from
+        the pool instead of generating fresh ones.  This avoids the
+        expensive CGL Jacobian + eigendecomposition at every step.
+    colloc_precompute_fn : callable or None
+        ``fn(Q_batch) -> dict(str -> Tensor)`` that precomputes target
+        quantities for a batch of collocation states.  The returned dict
+        keys are forwarded as keyword arguments to *physics_loss_fn*.
+        Use :func:`precompute_cgl_growth_rates` for growth-rate loss.
 
     Returns (model, history_dict).
     """
@@ -1398,6 +1495,26 @@ def train_surrogate(
 
     model_dtype = next(model.parameters()).dtype
 
+    # ── Precompute collocation pool (if requested) ──
+    _pool_Q = None
+    _pool_extra = None
+    if (colloc_pool_size > 0 and physics_loss_fn is not None
+            and lambda_phys > 0):
+        _pool_Q = sample_collocation_Q(
+            colloc_pool_size,
+            rho_range=colloc_rho_range,
+            Bmag_range=colloc_Bmag_range,
+            device=device, dtype=model_dtype,
+        )
+        if colloc_precompute_fn is not None:
+            _pool_extra = colloc_precompute_fn(_pool_Q)
+            print(f"Precomputed CGL targets for {colloc_pool_size} "
+                  f"collocation states "
+                  f"(keys: {list(_pool_extra.keys())}).")
+        else:
+            print(f"Presampled {colloc_pool_size} collocation states "
+                  f"(no precomputed targets).")
+
     for epoch in range(1, max_epochs + 1):
         # ── Curriculum: ramp physics-loss weight ──
         if physics_loss_fn is not None and lambda_phys > 0:
@@ -1406,22 +1523,34 @@ def train_surrogate(
             else:
                 lam = lambda_phys
 
-            def _phys_closure(net):
-                Q = sample_collocation_Q(
-                    n_colloc,
-                    rho_range=colloc_rho_range,
-                    Bmag_range=colloc_Bmag_range,
-                    device=device, dtype=model_dtype,
-                )
-                return physics_loss_fn(net, Q)
+            if _pool_Q is not None:
+                # Draw from precomputed pool
+                def _phys_loss(net):
+                    idx = torch.randperm(_pool_Q.shape[0],
+                                         device=_pool_Q.device)[:n_colloc]
+                    Q = _pool_Q[idx]
+                    if _pool_extra is not None:
+                        extra = {k: v[idx] for k, v in _pool_extra.items()}
+                        return physics_loss_fn(net, Q, **extra)
+                    return physics_loss_fn(net, Q)
+            else:
+                # Fresh collocation each step
+                def _phys_loss(net):
+                    Q = sample_collocation_Q(
+                        n_colloc,
+                        rho_range=colloc_rho_range,
+                        Bmag_range=colloc_Bmag_range,
+                        device=device, dtype=model_dtype,
+                    )
+                    return physics_loss_fn(net, Q)
         else:
-            _phys_closure = None
+            _phys_loss = None
             lam = 0.0
 
         tl, pl = _run_epoch(model, train_dl, optimizer, scheduler, loss_fn,
                             device, train=True,
                             rotate_batches=use_rotation_augmentation,
-                            physics_closure=_phys_closure,
+                            physics_loss=_phys_loss,
                             lambda_phys=lam)
         vl, _ = _run_epoch(model, test_dl, None, None, loss_fn, device,
                            train=False)
@@ -1442,7 +1571,7 @@ def train_surrogate(
             msg = (f"epoch {epoch:4d} | lr {lr_history[-1]:.2e} | "
                    f"train {tl:.4f} | test {vl:.4f} | "
                    f"best {best_test_loss:.4f} (ep {best_epoch})")
-            if _phys_closure is not None:
+            if _phys_loss is not None:
                 msg += f" | phys {pl:.4e} (λ={lam:.3e})"
             print(msg)
 
@@ -1527,5 +1656,6 @@ __all__ = [
     "closure_tangent_loss",
     "flux_jacobian_loss",
     "growth_rate_loss",
+    "precompute_cgl_growth_rates",
     "sample_collocation_Q",
 ]
